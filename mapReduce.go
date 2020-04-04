@@ -2,47 +2,43 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func openDatabase(path string) (*sql.DB, error) {
 	// the path to the database--this could be an absolute path
 
-	options :=
-		"?" + "_busy_timeout=10000" +
-			"&" + "_case_sensitive_like=OFF" +
-			"&" + "_foreign_keys=ON" +
-			"&" + "_journal_mode=OFF" +
-			"&" + "_locking_mode=NORMAL" +
-			"&" + "mode=rw" +
-			"&" + "_synchronous=OFF"
-	db, err := sql.Open("sqlite3", path+options)
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, fmt.Errorf("Error opening db: %v", err)
 	}
 	return db, nil
 }
-
 func createDatabase(path string) (*sql.DB, error) {
 	var db *sql.DB
-
 	if _, err := os.Stat(path); err == nil {
-		//remove db if exists
+		// database exists
+		//log.Printf("createDatabase called on database that  %v already exists, deleting it.", path)
 		os.Remove(path)
 		db, err = sql.Open("sqlite3", path)
 		if err != nil {
-			return nil, fmt.Errorf("Error creating db: %v", err)
+			return nil, fmt.Errorf("createDatabase: sql.Open: %v", err)
 		}
 	}
+
 	if _, err := db.Exec("create table pairs (key text, value text);"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("Error creating table pairs: %v", err)
+		return nil, fmt.Errorf("createDatabase: db.Exec(create table): %v", err)
 	}
 	return db, nil
 }
@@ -51,45 +47,79 @@ func splitDatabase(source, outputPattern string, m int) ([]string, error) {
 	db, err := openDatabase(source)
 	defer db.Close()
 	if err != nil {
-		return nil, fmt.Errorf("In splitDatabase: Could not open %v", err)
+		return nil, fmt.Errorf("splitDatabase: sql.Open: %v", err)
 	}
-
-	rows, err := db.Query("Select key, value from pairs;")
+	pairsc, err := db.Query("SELECT count(1) as count FROM pairs;")
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("In splitdatabase: Error selecting key and value %v", err)
+		return nil, fmt.Errorf("splitDatabase: db.Query(count): %v", err)
+	}
+	var count int
+	for pairsc.Next() {
+		if err := pairsc.Scan(&count); err != nil {
+			return nil, fmt.Errorf("splitDatabase: scan-count: %v", err)
+		}
+	}
+
+	if count < m {
+		err := errors.New("splitDatabase: count less than m")
+		db.Close()
+		return nil, err
+	}
+	var pairsperpartition float64
+	pairsperpartition = float64(count) / float64(m)
+	math.Ceil(pairsperpartition)
+	log.Printf("PairsperPartition: %v", pairsperpartition)
+	rows, err := db.Query("SELECT key, value FROM pairs;")
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("splitDatabase: db.Query(Select): %v", err)
 	}
 	defer rows.Close()
-
-	a := 0
-	b := 0
-
-	var pathSlice []string
-	allPaths := fmt.Sprintf(outputPattern, b)
-	pathSlice = append(pathSlice, allPaths)
-	splitUpDatabase, err := createDatabase(allPaths)
+	i := 0
+	j := 0
+	var pathTitles []string
+	dbsplit := fmt.Sprintf(outputPattern, j)
+	pathTitles = append(pathTitles, dbsplit)
+	finalDB, err := createDatabase(dbsplit)
 	if err != nil {
-		return nil, fmt.Errorf("err in splitDatabase function", err)
+		return nil, fmt.Errorf("splitDatabase: sql.Open: (split) %v", err)
 	}
-
+	_, err = finalDB.Exec("CREATE TABLE IF NOT EXISTS pairs (key text, value text);")
+	if err != nil {
+		return nil, fmt.Errorf("splitDatabase: db.Exec(CREATE TABLE): %v", err)
+	}
 	for rows.Next() {
-		a++
+		i++
+		if i > int(pairsperpartition) {
+			i = 0
+			finalDB.Close()
+			j++
+			dbsplit = fmt.Sprintf(outputPattern, j)
+			pathTitles = append(pathTitles, dbsplit)
+			finalDB, err = createDatabase(dbsplit)
+			if err != nil {
+				return nil, fmt.Errorf("splitDatabase: sql.Open: (split) %v", err)
+			}
+			_, err := finalDB.Exec("CREATE TABLE IF NOT EXISTS pairs (key text, value text);")
+			if err != nil {
+				return nil, fmt.Errorf("splitDatabase: db.Exec(CREATE TABLE): %v", err)
+			}
+		}
 		var key string
-		var val string
-
-		if err := rows.Scan(&key, &val); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("Scan error %v", err)
+		var value string
+		if err := rows.Scan(&key, &value); err != nil {
+			finalDB.Close()
+			return nil, fmt.Errorf("splitDatabase: rows.Scan: %v", err)
 		}
-		if _, err := splitUpDatabase.Exec("insert into pairs (key,value) values (?,?);", key, val); err != nil {
-			splitUpDatabase.Close()
-			return nil, fmt.Errorf("splitDatabase: db.Exec(insert into): %v", err)
+		if _, err := finalDB.Exec("INSERT INTO pairs (key,value) VALUES (?,?);", key, value); err != nil {
+			finalDB.Close()
+			return nil, fmt.Errorf("splitDatabase: db.Exec(INSERT INTO): %v", err)
 		}
-		log.Printf("key,value: %v,%v", key, val)
-
+		//log.Printf("key,value: %v,%v", key, value)
 	}
-	splitUpDatabase.Close()
-	return pathSlice, nil
+	finalDB.Close()
+	return pathTitles, nil
 }
 
 func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
@@ -169,4 +199,17 @@ func gatherInto(db *sql.DB, path string) error {
 
 func main() {
 
+	// myaddress := ":8080"
+	// tempdir := "/tmp"
+
+	// go func() {
+	// 	http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(tempdir))))
+	// 	if err := http.ListenAndServe(myaddress, nil); err != nil {
+	// 		log.Printf("Error in HTTP server for %s: %v", myaddress, err)
+	// 	}
+	// }()
+	//openDatabase("austen.sqlite3")
+	//createDatabase("austen.sqlite3")
+
+	splitDatabase("./austen.sqlite3", "output-%d.sqlite3", 50)
 }

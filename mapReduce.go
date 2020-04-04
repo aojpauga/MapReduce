@@ -3,8 +3,12 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 )
 
 func openDatabase(path string) (*sql.DB, error) {
@@ -49,6 +53,7 @@ func splitDatabase(source, outputPattern string, m int) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("In splitDatabase: Could not open %v", err)
 	}
+
 	rows, err := db.Query("Select key, value from pairs;")
 	if err != nil {
 		db.Close()
@@ -106,6 +111,60 @@ func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 		}
 	}
 	return finalDataBase, nil
+}
+
+func download(douwnloadUrl, path string) (string, error) {
+	res, err := http.Get(douwnloadUrl)
+	if err != nil {
+		return "", fmt.Errorf("error in download", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("err in download", err)
+	}
+	defer res.Body.Close()
+	fmt.Println("URL:", douwnloadUrl)
+	fmt.Println("body:", res.Body)
+
+	file, err := url.Parse(douwnloadUrl)
+	if err != nil {
+		return "", fmt.Errorf("Err in download parsing: ", err)
+	}
+	filePath := file.Path
+	paths := strings.Split(filePath, "/")
+	newFile := paths[len(paths)-1]
+	finalFile := path + "/" + newFile
+	out, err := os.Create(finalFile)
+	if err != nil {
+		return "", fmt.Errorf("err in download: ", err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, res.Body)
+	if err != nil {
+		return "", fmt.Errorf("err in download", err)
+	}
+	return finalFile, err
+
+}
+
+func gatherInto(db *sql.DB, path string) error {
+	_, err := db.Exec("attach ? as merge;", path)
+	if err != nil {
+		return fmt.Errorf("err in gatherInto attach", err)
+	}
+	_, err = db.Exec("insert into pairs select * from merge.pairs;")
+	if err != nil {
+		return fmt.Errorf("err in gatherInto, insert", err)
+	}
+	_, err = db.Exec("detach merge;")
+	if err != nil {
+		return fmt.Errorf("err in gatherInto , detach", err)
+	}
+	if err = os.Remove(path); err != nil {
+		return fmt.Errorf("err in gatherInto, remove", err)
+	}
+	return err
+
 }
 
 func main() {
